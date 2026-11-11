@@ -85,4 +85,36 @@ class AdminCreateUserTest extends TestCase
         $this->postJson('/api/v1/admin/users', $this->payload('admin'))->assertForbidden();
         $this->postJson('/api/v1/admin/users', $this->payload('superadmin'))->assertForbidden();
     }
+
+    public function test_superadmin_sets_staff_access_at_creation(): void
+    {
+        Sanctum::actingAs($this->account('superadmin'));
+
+        $res = $this->postJson('/api/v1/admin/users', $this->payload('moderator', [
+            'permissions' => ['review_kyc', 'view_wallets'],
+        ]))->assertCreated();
+
+        $user = User::findOrFail($res->json('data.id'));
+        $effective = $user->effectivePermissions();
+        $this->assertContains('review_kyc', $effective);
+        $this->assertContains('view_wallets', $effective);          // not a moderator default: granted
+        $this->assertNotContains('review_submissions', $effective); // a moderator default: denied
+    }
+
+    public function test_create_options_and_phone(): void
+    {
+        Sanctum::actingAs($this->account('superadmin'));
+
+        $this->getJson('/api/v1/admin/users/create-options')
+            ->assertOk()
+            ->assertJsonPath('data.roles.4', 'superadmin')
+            ->assertJsonPath('data.grantable', null);
+
+        $res = $this->postJson('/api/v1/admin/users', $this->payload('contributor', [
+            'phone_country_code' => '+995',
+            'phone_number' => '555123456',
+            'country_code' => 'GE',
+        ]))->assertCreated();
+        $this->assertSame('+995555123456', User::findOrFail($res->json('data.id'))->phone);
+    }
 }

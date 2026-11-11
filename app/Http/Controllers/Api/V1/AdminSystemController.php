@@ -296,6 +296,40 @@ class AdminSystemController extends Controller
      * scoped admin / moderator's new account is assigned to them so it stays
      * inside their scope.
      */
+    /**
+     * GET /admin/users/create-options (create_users): what the Create user
+     * form may offer this actor — roles, each staff role's default access,
+     * the staff permission catalog, and which permissions the actor may give.
+     */
+    public function createUserOptions(Request $request): JsonResponse
+    {
+        $actor = $request->user();
+        $defs = Permission::definitions();
+        $staffNames = array_keys(array_filter($defs, fn ($d) => $d[1] === 'staff'));
+
+        $roleDefaults = [];
+        foreach (['admin', 'moderator'] as $role) {
+            $r = Role::where('name', $role)->first();
+            $roleDefaults[$role] = $r ? $r->permissions()->pluck('permissions.name')->values()->all() : [];
+        }
+
+        $existing = Permission::whereIn('name', $staffNames)->pluck('name')->all();
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'roles' => self::creatableRoles($actor),
+                'role_permissions' => $roleDefaults,
+                'permissions' => array_values(array_map(
+                    fn ($name) => ['name' => $name, 'label' => $defs[$name][0], 'group' => 'staff'],
+                    array_values(array_intersect($staffNames, $existing))
+                )),
+                // null = may give anything (Super Admin).
+                'grantable' => $actor->isSuperAdmin() ? null : $actor->effectivePermissions(),
+            ],
+        ]);
+    }
+
     public function createUser(Request $request): JsonResponse
     {
         $actor = $request->user();
@@ -311,6 +345,16 @@ class AdminSystemController extends Controller
             'website' => 'nullable|url|max:255',
             'industry' => 'nullable|string|max:255',
             'country_code' => 'nullable|string|size:2',
+            // Same phone rules as public signup; optional here, but both parts together.
+            'phone_country_code' => ['nullable', 'required_with:phone_number', 'string', new \App\Rules\PhoneCountryCode()],
+            'phone_number' => ['nullable', 'required_with:phone_country_code', 'string', 'regex:/^\d{4,15}$/'],
+            'referral_code' => 'nullable|string|max:32',
+            // Admin / moderator: the exact staff access this account gets.
+            // Omitted = the role's defaults from Roles & Permissions.
+            'permissions' => 'nullable|array',
+            'permissions.*' => 'string|exists:permissions,name',
+        ], [
+            'phone_number.regex' => 'The phone number must contain 4-15 digits only.',
         ]);
 
         if ($validator->fails()) {
@@ -330,15 +374,81 @@ class AdminSystemController extends Controller
             ], 403);
         }
 
+        $phone = null;
+        if (!empty($data['phone_number'])) {
+            $phone = \App\Services\Auth\EmailOtpService::normalizePhone($data['phone_country_code'], $data['phone_number']);
+            if ($phone === null) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'The phone number is not valid.',
+                    'errors' => ['phone_number' => ['The phone number is not valid.']],
+                ], 422);
+            }
+            if (User::where('phone', $phone)->exists()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'This phone number is already used by another account.',
+                    'errors' => ['phone_number' => ['This phone number is already used by another account.']],
+                ], 422);
+            }
+        }
+
+        $referrer = null;
+        if (!empty($data['referral_code']) && in_array($data['role'], ['contributor', 'business'], true)) {
+            $referrer = User::where('referral_code', strtoupper(trim($data['referral_code'])))->first();
+            if (!$referrer) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No account uses this referral code.',
+                    'errors' => ['referral_code' => ['No account uses this referral code.']],
+                ], 422);
+            }
+        }
+
+        // Staff access overrides: the chosen set, stored as grants / denies
+        // against the role defaults so later role changes still apply to
+        // everything not touched here.
+        $grants = [];
+        $denies = [];
+        if (in_array($data['role'], ['admin', 'moderator'], true) && array_key_exists('permissions', $data) && $data['permissions'] !== null) {
+            $defs = Permission::definitions();
+            $staffNames = array_keys(array_filter($defs, fn ($d) => $d[1] === 'staff'));
+            $chosen = array_values(array_intersect(array_unique($data['permissions']), $staffNames));
+            $roleModel = Role::where('name', $data['role'])->first();
+            $roleDefaults = $roleModel ? $roleModel->permissions()->pluck('permissions.name')->all() : [];
+
+            $grants = array_values(array_diff($chosen, $roleDefaults));
+            $denies = array_values(array_diff(array_intersect($roleDefaults, $staffNames), $chosen));
+
+            if (!$actor->isSuperAdmin()) {
+                $excess = array_values(array_diff($grants, $actor->effectivePermissions()));
+                if ($excess !== []) {
+                    $labels = array_map(fn ($p) => Permission::catalog()[$p] ?? $p, $excess);
+
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'You can only give permissions you have yourself. Not allowed: ' . implode(', ', $labels) . '.',
+                        'code' => 'permission_not_held',
+                    ], 403);
+                }
+            }
+        }
+
         $managedBy = (!$actor->isSuperAdmin() && StaffScope::isScoped($actor)) ? $actor->id : null;
 
-        $user = DB::transaction(function () use ($data, $managedBy) {
+        $user = DB::transaction(function () use ($data, $managedBy, $phone, $referrer, $grants, $denies) {
             $user = User::create([
                 'uuid' => (string) Str::uuid(),
                 'name' => $data['name'],
                 'email' => $data['email'],
                 'password' => Hash::make($data['password']),
+                'phone' => $phone,
+                'referrer_id' => $referrer?->id,
             ]);
+
+            if ($grants !== [] || $denies !== []) {
+                $user->syncPermissionOverrides($grants, $denies);
+            }
             // System fields: set explicitly (not fillable).
             $user->forceFill(array_filter([
                 'role' => $data['role'],
@@ -375,6 +485,11 @@ class AdminSystemController extends Controller
                     'billing_email' => $data['email'],
                     'status' => 'active',
                 ]);
+            }
+
+            // Referral code: same multi-level chain as a public signup.
+            if ($referrer) {
+                app(\App\Services\Referral\ReferralService::class)->buildChain($user->load('referrer'));
             }
 
             return $user;

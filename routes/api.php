@@ -451,6 +451,8 @@ Route::prefix('v1')->group(function () {
             // create_users create only roles below their own.
             Route::post('/users', [AdminSystemController::class, 'createUser'])
                 ->middleware(['permission:create_users', 'throttle:30,1']);
+            Route::get('/users/create-options', [AdminSystemController::class, 'createUserOptions'])
+                ->middleware('permission:create_users');
 
             // The user list feeds Users & KYC, Businesses and Wallets; the
             // controller narrows it to businesses for a Businesses-only admin.
