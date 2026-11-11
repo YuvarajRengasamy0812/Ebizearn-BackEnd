@@ -502,7 +502,7 @@ class AdminSystemController extends Controller
 
         return response()->json([
             'success' => true,
-            'message' => ucfirst($user->role) . ' account created. It can sign in with this email and password.',
+            'message' => ($user->role === 'superadmin' ? 'Super Admin' : ucfirst($user->role)) . ' account created. It can sign in with this email and password.',
             'data' => $user->load(['business', 'wallet', 'profile']),
         ], 201);
     }
