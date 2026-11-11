@@ -446,6 +446,11 @@ Route::prefix('v1')->group(function () {
             // Create a business user account (ready to sign in, business role only).
             Route::post('/businesses', [AdminSystemController::class, 'createBusinessUser'])
                 ->middleware(['permission:create_business_users', 'throttle:30,1']);
+            // Create a user of any role from Users & KYC. Super Admin creates
+            // every role (incl. admin / super admin); staff granted
+            // create_users create only roles below their own.
+            Route::post('/users', [AdminSystemController::class, 'createUser'])
+                ->middleware(['permission:create_users', 'throttle:30,1']);
 
             // The user list feeds Users & KYC, Businesses and Wallets; the
             // controller narrows it to businesses for a Businesses-only admin.
